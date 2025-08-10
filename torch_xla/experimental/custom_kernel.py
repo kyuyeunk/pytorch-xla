@@ -1076,7 +1076,7 @@ def quantized_matmul_int8(
     in_block_size: int | None = None,
 ) -> torch.Tensor:
   from torch_xla.experimental.pallas_kernels.quantized_matmul_kernel import (
-      quantized_matmul_int8,
+      quantized_matmul_kernel,
       get_tuned_block_sizes,
       TUNED_BLOCK_SIZES,
   )
@@ -1090,7 +1090,7 @@ def quantized_matmul_int8(
       jnp.dtype(jax_dtype).name, quantize_activation)
   if batch_block_size is not None and out_block_size is not None and in_block_size is not None:
     return xb.call_jax(
-        quantized_matmul_int8, (x, w, scalar), {
+        quantized_matmul_kernel, (x, w, scalar), {
             "zero_point": zero_point,
             "quant_block_size": quant_block_size,
             "quantize_activation": quantize_activation,
