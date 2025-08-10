@@ -19,7 +19,7 @@ def quantize_array(
   # TODO(kyuyeunk): Investigate performance gain from non xlu transpose.
   scale = jnp.transpose(x_abs_max / int_max)  # [bs_block_size, 1]
   x_int = jnp.round(x / scale).astype(jnp.int8)
-  return x_int, scale.astype(jnp.float32)
+  return x_int, scale
 
 
 def get_vmem_limit(
@@ -62,8 +62,9 @@ def get_vmem_limit(
   x_q_size = batch_block_size * in_block_size * dtypes.bit_width(x_q_dtype)
   x_scale_size = batch_block_size * dtypes.bit_width(scale_dtype)
 
-  vmem_scratch = acc_size if save_acc else 0
-  vmem_scratch += x_q_size + x_scale_size if save_x_q else 0
+  vmem_scratch = x_scale_size
+  vmem_scratch += acc_size if save_acc else 0
+  vmem_scratch += x_q_size if save_x_q else 0
   vmem_scratch *= 2  # Account for compute and vreg spills.
 
   # Add in/out and scratch VMEM size.
@@ -117,11 +118,9 @@ def matmul_kernel(
   if save_x_q:
     assert quantize_activation
     assert x_q_scratch is not None
-    assert x_scale_scratch is not None
     quant = (out_idx == 0)
   else:
     assert x_q_scratch is None
-    assert x_scale_scratch is None
     quant = quantize_activation
 
   if save_acc:
@@ -137,18 +136,23 @@ def matmul_kernel(
   def matmul_body(quant, is_first_step, is_last_step):
     if quantize_activation:
       if quant:
-        x_q_tmp, x_scale_tmp = quantize_array(x_ref[...], x_abs_max_ref[...])
+        if is_first_step:
+          x_q, x_scale = quantize_array(x_ref[...], x_abs_max_ref[...])
+          x_scale_scratch[...] = x_scale
+        else:
+          x_scale = x_scale_scratch[...]
+          x_q = jnp.round(x_ref[...] / x_scale).astype(jnp.int8)
+
         if save_x_q:
-          x_q_scratch[...] = x_q_tmp
-          x_scale_scratch[...] = x_scale_tmp
+          x_q_scratch[...] = x_q
       else:
         assert save_x_q
-        x_q_tmp = x_q_scratch[...]
+        x_q = x_q_scratch[...]
         if is_last_step:
-          x_scale_tmp = x_scale_scratch[...]
+          x_scale = x_scale_scratch[...]
 
       acc = jax.lax.dot_general(
-          x_q_tmp,
+          x_q,
           w_q_ref[...],
           (((1,), (1,)), ((), ())),
           preferred_element_type=jnp.int32,
@@ -168,7 +172,7 @@ def matmul_kernel(
       acc *= w_scale_ref[...]
       if quantize_activation:
         # TODO(kyuyeunk): Investigate performance gain from caching broadcast.
-        acc *= x_scale_tmp
+        acc *= x_scale
       out_ref[...] = acc.astype(x_ref_dtype)
     else:
       assert save_acc
@@ -289,9 +293,8 @@ def quantized_matmul_kernel(
               if save_acc else None,  # acc_scratch
               pltpu.VMEM((batch_block_size, in_block_size), jnp.int8)
               if save_x_q else None,  # x_q_scratch
-              pltpu.VMEM(
-                  (batch_block_size,
-                   1), jnp.float32) if save_x_q else None,  # x_scale_scratch
+              pltpu.VMEM((batch_block_size, 1),
+                         jnp.bfloat16),  # x_scale_scratch
           ],
           grid=(n_bs, n_out, n_in),
       ),
